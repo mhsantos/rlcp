@@ -46,7 +46,9 @@ These are the operations accepted:
 
 * `run <command>` schedules a command to be executed and returns an id for the scheduled job.
 
-* `get <job id>` searches for the scheduled job. If available returns its status and output.
+* `status <job id>` searches for the scheduled job id. Returns its status or an appropriate error message if not found or the user doesn't have the permissions to see it.
+
+* `output <job id>` gets the output stream for the specified job or an error message if the job is invalid.
 
 * `del <job id>` deletes a scheduled job.
 
@@ -71,12 +73,18 @@ OPERATIONS
          rlcp run "ls -la"
          rlcp run "tail -f server.log"
     
-    get <job id>
-        gets the status and output (if available) of a scheduled job
+    status <job id>
+        gets the status for the job or an error message if the id is invalid.
 
         Example:
-        rlcp get bf7a1eae-8d25-4de5-995b-8c4d3ef8b848
+        rlcp status bf7a1eae-8d25-4de5-995b-8c4d3ef8b848
     
+    output <job id>
+        prints the output for the job or an error message if the id is invalid.
+
+        Example:
+        rlcp output 8060271e-b776-4444-9e75-bd2e3db3cc7d
+
     del <job id>
         deletes a scheduled job
 
@@ -124,47 +132,50 @@ option go_package = ".;pb";
 service RemoteExecutor {
 	// Enqueues a command for execution on the server
 	rpc ExecCommand (CmdRequest) returns (EnqueuedJobDetails) {}
-    // Gets the status and if available output from the command
-	rpc GetResult (GetRequest) returns (stream JobOutput) {}
-    // Deletes a job from the queue. If the command is still running, it is cancelled
-    rpc DeleteJob (DeleteRequest) returns (Deleted) {}
-  }
+  // Gets the status for the requested Job Id
+	rpc GetStatus (GetRequest) returns (stream JobStatus) {}
+  // Gets the output for the requested Job Id
+	rpc GetOutput (GetRequest) returns (stream JobOutput) {}
+  // Deletes a job from the queue. If the command is still running, it is cancelled
+  rpc DeleteJob (DeleteRequest) returns (Deleted) {}
+}
   
-  // The request message containing the command
-  message CmdRequest {
-	  string command = 1;
-  }
+// The request message containing the command
+message CmdRequest {
+  string command = 1;
+}
 
-  // The response message containing job id
-  message EnqueuedJobDetails {
-	  string job_id = 1;
-  }
+// The response message containing job id
+message EnqueuedJobDetails {
+  string job_id = 1;
+}
 
-  // The request for a Job status
-  message GetRequest {
-    string job_id = 1;
-  }
-  
-  // The response for a Get Job, with the combined output from stdout and stderr
-  message JobOutput {
-    oneof result {
-      bytes output = 1;
-      // inform here if the job hasn't started yet or some othe issue happened
-      message string = 2;
-    }
-  }
+// The request for a Job status
+message GetRequest {
+  string job_id = 1;
+}
 
-  // The request for a Delete operation containing the job id
-  message DeleteRequest {
-    string job_id = 1;
-  }
+// The status for a Get Job
+message JobStatus {
+  string status = 1; // pending, running, finished
+}
 
-  // The result of a Delete operation
-  message Deleted {
-    bool deleted = 1;
-    string message = 2;
-  }
-  ```
+// The response for a Get Job, with the combined output from stdout and stderr
+message JobOutput {
+    bytes output = 1;
+}
+
+// The request for a Delete operation containing the job id
+message DeleteRequest {
+  string job_id = 1;
+}
+
+// The result of a Delete operation
+message Deleted {
+  bool deleted = 1;
+  string message = 2;
+}
+```
 
 It is a very simple API implementing the three basic operations to schedule, query and delete a command.
 
@@ -179,13 +190,17 @@ Currently all information about users and jobs is stored in memory, but it can b
 type JobStore interface {
 	// GetUserId returns the UUID for the user matching the identifier on the request
 	GetUserId(identifier string) (string, bool)
+
 	// Authorized validates if the user requesting an operation on a job is the same that scheduled it
 	Authorized(userId, jobId string) bool
+
 	// Schedules a command for the user
 	ScheduleCommand(userId, command string)
+
 	// Gets the status and output for a Command.
 	// When the command finishes executing and the Out channel is drained, the response is deleted from the storage.
 	GetResponse(userId, jobId string) (*Response, bool)
+  
 	// Deletes the job from the storage
 	DeleteJob(userId, jobId string) bool
 }
