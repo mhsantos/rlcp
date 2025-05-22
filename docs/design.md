@@ -31,6 +31,13 @@ When a user calls the CLI to run a command on the remote linux server the follow
 
 We expand on the details below.
 
+## Authorization
+
+When the Server receives a request, first it validates if the user is in the Storage.
+It will extract the email from the CommonName in the certificate and will run `Storage.GetUserId(email)` to see if the user exists.
+
+If the user exists, the authorization is based on the operation. For new commands, there is no validation necessary. For query or delete a Job, the server will extract the identity from the authorization info in the request's context and verify in `Storage.Authorized(userId, jobId)` if the user requesting the operation is the same that created the Job.
+
 ## CLI
 
 The CLI is a simple Go main package that parses the input from the user and validates if it follows the required syntax.
@@ -140,7 +147,11 @@ service RemoteExecutor {
   
   // The response for a Get Job, with the combined output from stdout and stderr
   message JobOutput {
-    bytes output = 1;
+    oneof result {
+      bytes output = 1;
+      // inform here if the job hasn't started yet or some othe issue happened
+      message string = 2;
+    }
   }
 
   // The request for a Delete operation containing the job id
@@ -151,6 +162,7 @@ service RemoteExecutor {
   // The result of a Delete operation
   message Deleted {
     bool deleted = 1;
+    string message = 2;
   }
   ```
 
@@ -193,3 +205,15 @@ Its purpose is to allow a client to schedule a job asynchronously, getting a Job
 ## Executor
 
 The executor is the Go routine that will actually call the OS to run the command. Some commands like `pwd` may run completely and return the output instantly. Others, like `top` may not complete unless cancelled or errored. For those scenarios we can run multiple executors, to allow for parallel command execution.
+
+This is the flow of actions for an executor:
+
+1. takes a Job from the Job Queue (guarded by a mutex)
+1. uses the `os/exec` library to run the command on the OS
+1. creates a buffered channel listening to `stdout` and `stderr` and writes the output to `Job.Out`
+1. if the output fits in the buffered channel and the command completes, the executor will end this cycle and pick up the next Job
+1. if the output doesn't fit `Job.Out`, it will block. When the client queries for the Job response, they will stream what's already in the buffer plus what is being produced.
+1. that will continue indefinitely until the process finishes executing or the user Deletes it.
+1. a few tests/actions are needed here:
+    + when the buffer channel is full, what happens to `strout` if it keeps filling?
+    + we should either add a timeout or some other buffer like disk storage to avoid blocking the worker.
