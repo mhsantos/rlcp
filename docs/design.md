@@ -147,7 +147,7 @@ service RemoteExecutor {
 	// Enqueues a command for execution on the server
 	rpc ExecCommand (CmdRequest) returns (EnqueuedJobDetails) {}
   // Gets the status for the requested Job Id
-	rpc GetStatus (GetRequest) returns (stream JobStatus) {}
+	rpc GetStatus (GetRequest) returns (JobStatus) {}
   // Gets the output for the requested Job Id
 	rpc GetOutput (GetRequest) returns (stream JobOutput) {}
   // Deletes a job from the queue. If the command is still running, it is cancelled
@@ -171,7 +171,12 @@ message GetRequest {
 
 // The status for a Get Job
 message JobStatus {
-  string status = 1; // pending, running, finished
+  enum Status {
+    PENDING = 0;
+    RUNNING = 1;
+    FINISHED = 2;
+  }
+  Status status = 1;
 }
 
 // The response for a Get Job, with the combined output from stdout and stderr
