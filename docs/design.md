@@ -116,6 +116,20 @@ Before starting the gRPC server, the server reads the following keys from the lo
 `./x509/server_key.pem`: the server's private key.<br />
 `./x509/server_cert.pem`: the server's certificate with its counterpart public key.
 
+The TLS configuration expects the TLS min and max versions being 1.3:
+
+```
+// TLS config on the server
+config := tls.Config{
+  ClientAuth:            tls.RequireAndVerifyClientCert,
+  Certificates:          []tls.Certificate{cert},
+  ClientCAs:             ca,
+  VerifyPeerCertificate: authorizeClient,
+  MinVersion:            tls.VersionTLS13,
+  MaxVersion:            tls.VersionTLS13,
+}
+```
+
 If the server fails to read any of the keys or certificates, it logs an error message and exits.
 
 With the keys loaded, the server starts a gRPC server with the TLS transport credentials listed above. The gRPC server also validates the caller identity on every request before parsing more fine-grained authorization.
@@ -200,7 +214,7 @@ type JobStore interface {
 	// Gets the status and output for a Command.
 	// When the command finishes executing and the Out channel is drained, the response is deleted from the storage.
 	GetResponse(userId, jobId string) (*Response, bool)
-  
+
 	// Deletes the job from the storage
 	DeleteJob(userId, jobId string) bool
 }
