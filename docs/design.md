@@ -5,12 +5,13 @@ It schedules a received command and returns a job id to the requester, who can l
 
 ## Terminology
 
+* User: a human or script calling the CLI to run a command on a remote Linux server
 * Command: any executable program that is available on the machine running the service
 * CLI : an executable on the client side that parses the request from the user and calls client to process the command
 * Client: the process on the client side that configures and uses gRPC to invoke operations on the server side
 * Server: the server side of the client-server communication, where the server runs
 * Storage: a temporary data structure storing information about existing users, roles and jobs
-* Job: an object with information about a scheduled command including requester, command and output channel
+* Job: an object to refer to a command that was issued on a remote Linux machine with additional information like Id, status and output
 
 ## Overview
 
@@ -18,16 +19,12 @@ The architecture for the service is represented on the diagram below:
 
 ![architecture](../images/rlcp_architecture.png)
 
-When a user calls the CLI to run a command on the remote linux server the following sequence of operations happen:
+When a user calls the CLI to run a command on the remote Linux server the following sequence of operations happen:
 
 1. the CLI parses and validates the command
-1. the CLI calls the Client, which reads the TLS keys from local storage, formats the input arguments into the appropriate object and calls the operation on the server using gRPC
+1. the CLI calls the Client, which reads the TLS keys from local storage and adds the config to the transport credentials. It then formats the input arguments into the appropriate object and calls the operation on the server using gRPC.
 1. on the server side, the server opens a net listener and accepts requests from the client side using gRPC. When configuring gRPC, the server uses the keys from local storage.
-1. the Server starts the Execution Manager, which creates a Job Queue to store the commands to be executed.
-1. the Execution Manager also creates the Executors necessary to execute the jobs, controlling a pool of executors to guarantee that the server is not overwhelmed.
-1. when receiving a new command, the server validates on local storage if the appropriate permissions
-1. for a `run` command, the Server calls the Execution Manager to enqueue a command for execution.
-1. for the other commands, the Server returns the status or deletes the Job from the Storage.
+1. the server will then extract the user identification from the certificate CN authorize the request. Please look at the [Authorization](#authorization) section below for details.
 
 We expand on the details below.
 
@@ -36,7 +33,10 @@ We expand on the details below.
 When the Server receives a request, first it validates if the user is in the Storage.
 It will extract the email from the CommonName in the certificate and will run `Storage.GetUserId(email)` to see if the user exists.
 
-If the user exists, the authorization is based on the operation. For new commands, there is no validation necessary. For query or delete a Job, the server will extract the identity from the authorization info in the request's context and verify in `Storage.Authorized(userId, jobId)` if the user requesting the operation is the same that created the Job.
+The Storage will contain a map of users to roles.
+The users key will be an email and the roles eiter `general` or `readonly`. 
+
+If the user exists, each gRPC method will perforn a specific authorization. `ExecCommand()` and `StopJob()` require the user to have a `general` role, while for `GetStatus()` and `GetOutput`, either `general` or `readonly` is valid.
 
 ## CLI
 
@@ -44,13 +44,13 @@ The CLI is a simple Go main package that parses the input from the user and vali
 
 These are the operations accepted:
 
-* `run <command>` schedules a command to be executed and returns an id for the scheduled job.
+* `run <command>` calls the server to execute the provided command. Retures a Job Id identifying the job or an error message if the user doesn't have the permissions.
 
-* `status <job id>` searches for the scheduled job id. Returns its status or an appropriate error message if not found or the user doesn't have the permissions to see it.
+* `status <job id>` queries the status of an Job on the server. The available statuses are: `running`, `completed`, `errored`, `stopped`.
 
-* `output <job id>` gets the output stream for the specified job or an error message if the job is invalid.
+* `output <job id>` gets the output for a Job. If the command is still running, the output will be streamed until the Job completes or is stopped.
 
-* `del <job id>` deletes a scheduled job.
+* `stop <job id>` stops a running job. If the job is already stopped, or the user doesn't have the necessary permission, an error message will be informed.
 
 Command helper message explaining how it works:
 
@@ -65,8 +65,8 @@ OPERATIONS
         shows this prompt
 
     run <command>
-        schedules the <command> parameter for execution. <command> should be a single word or if multiple words, encapsulated by double quotes.
-        this command returns a job id to be used to either query or delete the job later.
+        runs the informed <command> on the server. <command> should be a single word or if multiple words, encapsulated by double quotes.
+        this command returns a job id to be used to either query the status, get the output or stop the job later.
 
         Examples:
          rlcp run pwd
@@ -74,22 +74,22 @@ OPERATIONS
          rlcp run "tail -f server.log"
     
     status <job id>
-        gets the status for the job or an error message if the id is invalid.
+        gets the status for the job or an error message if the id is invalid or the user doesn't have the appropriate permissions.
 
         Example:
         rlcp status bf7a1eae-8d25-4de5-995b-8c4d3ef8b848
     
     output <job id>
-        prints the output for the job or an error message if the id is invalid.
+        prints the output for the job or an error message if the id is invalid or the user doesn't have the appropriate permissions.
 
         Example:
         rlcp output 8060271e-b776-4444-9e75-bd2e3db3cc7d
 
-    del <job id>
-        deletes a scheduled job
+    stop <job id>
+        stops the job identified by job id. Returns an error message if the id is invalid or the user doesn't have the appropriate permissions.
 
         Example:
-        rlcp del af1f8215-bee7-455d-874a-55f0e3fb20b5
+        rlcp stop af1f8215-bee7-455d-874a-55f0e3fb20b5
 ```
 
 ## Client
@@ -100,9 +100,9 @@ First the CLI command parses and validates the command line arguments.
 
 If the CLI command is valid, the client reads the local client certificate and key from `./x509/client_cert.pem` and `./x509/client_key.pem` respectively. It will error if the files are not present.
 
-Additionally the client reads the server's CA certificate, which may not be the same as the client's from `./x509/ca_cert.pem`.
+Additionally the client reads the server's CA certificate from `./x509/server_ca_cert.pem`.
 
-For this exercize we will use a 2048-bit RSA keys for both the server and the client.
+Both the client and the server use a 2048-bit RSA keys for mTLS.
 
 With the command arguments and certificate, the client will invoke the appropriate gRPC methods to communicate with the server.
 
@@ -112,7 +112,7 @@ The server opens a TCP listener on port 50001 and uses that listener to start a 
 
 Before starting the gRPC server, the server reads the following keys from the local filesystem:
 
-`./x509/client_ca_cert.pem`: the client CA certificate. The client CA may be different from the server's.<br />
+`./x509/client_ca_cert.pem`: the client CA certificate.<br />
 `./x509/server_key.pem`: the server's private key.<br />
 `./x509/server_cert.pem`: the server's certificate with its counterpart public key.
 
@@ -121,12 +121,12 @@ The TLS configuration expects the TLS min and max versions being 1.3:
 ```
 // TLS config on the server
 config := tls.Config{
-  ClientAuth:            tls.RequireAndVerifyClientCert,
-  Certificates:          []tls.Certificate{cert},
-  ClientCAs:             ca,
-  VerifyPeerCertificate: authorizeClient,
-  MinVersion:            tls.VersionTLS13,
-  MaxVersion:            tls.VersionTLS13,
+    ClientAuth:            tls.RequireAndVerifyClientCert,
+    Certificates:          []tls.Certificate{cert},
+    ClientCAs:             ca,
+    VerifyPeerCertificate: authorizeClient,
+    MinVersion:            tls.VersionTLS13,
+    MaxVersion:            tls.VersionTLS13,
 }
 ```
 
@@ -144,39 +144,39 @@ syntax = "proto3";
 option go_package = ".;pb";
 
 service RemoteExecutor {
-	// Enqueues a command for execution on the server
-	rpc ExecCommand (CmdRequest) returns (EnqueuedJobDetails) {}
-  // Gets the status for the requested Job Id
-	rpc GetStatus (GetRequest) returns (JobStatus) {}
-  // Gets the output for the requested Job Id
-	rpc GetOutput (GetRequest) returns (stream JobOutput) {}
-  // Deletes a job from the queue. If the command is still running, it is cancelled
-  rpc DeleteJob (DeleteRequest) returns (Deleted) {}
+    // Runs a command on the server and returns the Job details
+    rpc ExecCommand (CmdRequest) returns (JobDetails) {}
+
+    // Gets the status of a Job
+    rpc GetStatus (GetRequest) returns (JobDetails) {}
+
+    // Gets the output for the requested Job Id
+    rpc GetOutput (GetRequest) returns (stream JobOutput) {}
+
+    // Stops a job. 
+    rpc StopJob (StopRequest) returns (StopResponse) {}
 }
   
 // The request message containing the command
 message CmdRequest {
-  string command = 1;
+    string command = 1;
 }
 
 // The response message containing job id
-message EnqueuedJobDetails {
-  string job_id = 1;
+message JobDetails {
+    enum Status {
+        RUNNING = 0;
+        COMPLETED = 1;
+        ERRORED = 2;
+        STOPPED = 3;
+    }
+    string job_id = 1;
+    Status status = 2;
 }
 
 // The request for a Job status
 message GetRequest {
-  string job_id = 1;
-}
-
-// The status for a Get Job
-message JobStatus {
-  enum Status {
-    PENDING = 0;
-    RUNNING = 1;
-    FINISHED = 2;
-  }
-  Status status = 1;
+    string job_id = 1;
 }
 
 // The response for a Get Job, with the combined output from stdout and stderr
@@ -184,15 +184,15 @@ message JobOutput {
     bytes output = 1;
 }
 
-// The request for a Delete operation containing the job id
-message DeleteRequest {
-  string job_id = 1;
+// The request for a Stop operation containing the job id
+message StopRequest {
+    string job_id = 1;
 }
 
-// The result of a Delete operation
-message Deleted {
-  bool deleted = 1;
-  string message = 2;
+// The result of a Stop operation
+message StopResponse {
+    bool stopped = 1;
+    string error_message = 2;
 }
 ```
 
@@ -202,52 +202,68 @@ All of them call an authorizer to validate that the requester has the appropriat
 
 ## Storage
 
+
 Currently all information about users and jobs is stored in memory, but it can be later stored in key value stores, SQL databases or any other data structure implementing the following interface:
 
 ```
 // JobStore defines the methods persist and access job relevant data.
-type JobStore interface {
-	// GetUserId returns the UUID for the user matching the identifier on the request
-	GetUserId(identifier string) (string, bool)
-
-	// Authorized validates if the user requesting an operation on a job is the same that scheduled it
-	Authorized(userId, jobId string) bool
-
-	// Schedules a command for the user
-	ScheduleCommand(userId, command string)
-
-	// Gets the status and output for a Command.
-	// When the command finishes executing and the Out channel is drained, the response is deleted from the storage.
-	GetResponse(userId, jobId string) (*Response, bool)
-
-	// Deletes the job from the storage
-	DeleteJob(userId, jobId string) bool
+type User struct {
+    email string
+    role  string // one of: general or readonly
 }
 
-type Response struct {
-	Status string // pending, running, finished
-	Out    chan []byte
+type Job struct {
+    id string     // in UUID format
+    status string // one of: running, completed, errored or stopped
+}
+
+type JobStore interface {
+	  // GetUserId returns the UUID for the user matching the identifier on the request
+	  GetUser(email string) (User, bool)
+
+  	// Stores the Job details
+	  SaveJob(job *Job) error
+
+    // Get a Job
+    GetJob(jobId string) (*Job, error)
 }
 ```
 
-## Execution Manager
-
-The Execution Manager controls Job Queue and create Go routines to instantiate Executors to run the Jobs.
-
-Its purpose is to allow a client to schedule a job asynchronously, getting a Job Id right away, and get it processed later. It also controls the number of executors running, allowing a configuration between resources utilization latency.
-
 ## Executor
 
-The executor is the Go routine that will actually call the OS to run the command. Some commands like `pwd` may run completely and return the output instantly. Others, like `top` may not complete unless cancelled or errored. For those scenarios we can run multiple executors, to allow for parallel command execution.
+On this context Executor is just a fancy name for a Go routine.
 
-This is the flow of actions for an executor:
+Some commands like `pwd` may run completely and return the output instantly. Others, like `tail -f server.log` may not complete unless cancelled or errored. For that reason the Server will schedule each command on a separate Go routine.
 
-1. takes a Job from the Job Queue (guarded by a mutex)
-1. uses the `os/exec` library to run the command on the OS
-1. creates a buffered channel listening to `stdout` and `stderr` and writes the output to `Job.Out`
-1. if the output fits in the buffered channel and the command completes, the executor will end this cycle and pick up the next Job
-1. if the output doesn't fit `Job.Out`, it will block. When the client queries for the Job response, they will stream what's already in the buffer plus what is being produced.
-1. that will continue indefinitely until the process finishes executing or the user Deletes it.
-1. a few tests/actions are needed here:
-    + when the buffer channel is full, what happens to `strout` if it keeps filling?
-    + we should either add a timeout or some other buffer like disk storage to avoid blocking the worker.
+This is the flow of actions for an executor Go routine:
+
+1. the Executor uses the `os/exec` library to run the command on the OS
+1. listen to the `stdout` and `stderr` pipes and writes the output to files on disk, following the strategy defined below.
+
+## Coordination between the Output Writer and Readers
+
+One naive way to concurrently read and write of the output would be having the Executor writing to the disk and multiple readers in different Go routines reading form it. That would work, but the performance would cripple with multiple readers.
+
+To solve that problem we can implement a strategy with buffers and log files.
+
+For every command being executed we have:
+1. a `[]byte` buffer to store the temporary output from the command
+1. an integer counter, starting at 1 indicating how many log files we have. Let's call it `N`
+1. an OutputProcessor Go routine (we'll expand on it below)
+1. a pool of channels (`chan []byte`) for readers to receive the output. The channels must be buffered to prevent slow readers from impacting the performance
+1. files stored on the filesystem with the format `<uuid_[1..N]>.out`
+
+Instead of writing directly to disk, the Executor Go routine gets a lock on a `[]byte` buffer and append the output to it, until it is full. After it's full it will release the lock and wait for a new buffer to be available.
+
+A separate Go routine (the OutputProcessor mentioned above) waits for the lock to be available. Once acquired, it will:
+1. create a new buffer and pass it to the Executor, which will continue processing and appending to it
+1. write the contents of the old buffer to all the reader channels waiting
+1. create a new file on disk and write the contents to it
+1. increments the `N` counter
+1. gets back to wait for the lock on step 1.
+
+When a reader starts listening for a command output, it will:
+1. craete a read channel and add it to the pool of reader channels
+1. read the `N` counter
+1. read N files from disk, writing the contents to the the gRPC output stream
+1. listen to the read channel, writing every input that comes in to the gRPC output stream
