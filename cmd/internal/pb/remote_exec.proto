@@ -1,0 +1,52 @@
+syntax = "proto3";
+
+option go_package = ".;pb";
+
+import "google/protobuf/empty.proto";
+
+service RemoteExecutor {
+	// Runs a command on the server and returns the Job details
+	rpc ExecCommand (CmdRequest) returns (JobDetails) {}
+
+  // Gets the status of a Job
+	rpc GetStatus (GetRequest) returns (JobDetails) {}
+  
+  // Gets the output for the requested Job Id
+	rpc GetOutput (GetRequest) returns (stream JobOutput) {}
+  
+  // Stops a job. 
+  rpc StopJob (StopRequest) returns (google.protobuf.Empty) {}
+}
+  
+// The request message containing the command
+message CmdRequest {
+  string command = 1;
+  repeated string arguments = 2;
+}
+
+// The request for a Job status
+message GetRequest {
+  string job_id = 1;
+}
+
+// The status for a Get Job
+message JobDetails {
+    enum Status {
+        RUNNING = 0;
+        COMPLETED = 1;
+        ERRORED = 2;
+        STOPPED = 3;
+    }
+    string job_id = 1;
+    Status status = 2;
+}
+
+// The response for a Get Job, with the combined output from stdout and stderr
+message JobOutput {
+    bytes output = 1;
+}
+
+// The request for a Stop operation containing the job id
+message StopRequest {
+    string job_id = 1;
+}
