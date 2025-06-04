@@ -1,8 +1,6 @@
 package executor
 
 import (
-	"bufio"
-	"context"
 	"io"
 	"log/slog"
 	"os/exec"
@@ -10,8 +8,8 @@ import (
 	"github.com/mhsantos/rlcp/cmd/server/internal/storage"
 )
 
-func RunCommand(ctx context.Context, job *storage.Job, command string, args []string) error {
-	cmd := exec.CommandContext(ctx, command, args...)
+func RunCommand(job *storage.Job, command string, args []string) error {
+	cmd := exec.Command(command, args...)
 
 	job.Cmd = cmd
 
@@ -44,21 +42,32 @@ func ListenToCommandOutput(job *storage.Job, stdout, stderr io.ReadCloser) {
 	defer stdout.Close()
 	defer stderr.Close()
 
+	slog.Debug("listening to command output")
+
 	stream := io.MultiReader(stdout, stderr)
 
-	streamReader := bufio.NewReader(stream)
 	buff := make([]byte, 1024)
 	for {
-		n, err := streamReader.Read(buff)
+		n, err := stream.Read(buff)
 		if n > 0 {
-			job.ProcessOutput(buff[:n])
+			err = job.ProcessOutput(buff[:n])
+			if err != nil {
+				slog.Error("error processing output", slog.Any("error", err))
+				if err := job.Cmd.Process.Kill(); err != nil {
+					slog.Error("error killing process", slog.Any("error", err))
+					return
+				}
+			}
 		} else {
 			if err != nil {
 				slog.Error("finished reading?", slog.Any("err", err), slog.Bool("io.EOF", err == io.EOF))
 				if err == io.EOF {
+					slog.Debug("ListenToCommandOutput EOF")
 					job.Status = storage.Completed
 					return
 				}
+				job.Status = storage.Errored
+				return
 			}
 		}
 	}

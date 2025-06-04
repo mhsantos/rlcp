@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"os"
@@ -12,6 +13,10 @@ import (
 
 type Operation uint
 type JobStatus uint
+
+const (
+	logFileSize int = 1024 * 1024 // 1MB
+)
 
 const (
 	Run Operation = iota
@@ -49,21 +54,22 @@ type Job struct {
 	Status    JobStatus
 	Cmd       *exec.Cmd
 	mu        sync.Mutex
-	log       CmdLog
+	log       *CmdLog
 	listeners []chan []byte
 }
 
 // CmdLog manages the files and byte buffers storing the output from a command
 type CmdLog struct {
 	nFiles int
-	buffer []byte
+	buffer *[]byte
 }
 
 func NewJob() *Job {
+	buffer := make([]byte, 0)
 	return &Job{
 		Id: uuid.New(),
-		log: CmdLog{
-			buffer: make([]byte, 0),
+		log: &CmdLog{
+			buffer: &buffer,
 		},
 		listeners: make([]chan []byte, 0),
 	}
@@ -71,24 +77,39 @@ func NewJob() *Job {
 
 // ProcessOutput receives an array of bytes from the command's output and sends it to the receiver channels.
 // After that it stores it in a temporary buffer. Once that buffer is full, it's stored on disk and flushed.
-func (j *Job) ProcessOutput(out []byte) {
+func (j *Job) ProcessOutput(out []byte) error {
 	j.mu.Lock()
 	for _, listener := range j.listeners {
 		listener <- out
 	}
 	j.log.appendBytes(out)
+
+	if len(*j.log.buffer) >= logFileSize {
+		err := persistLog(j)
+		if err != nil {
+			j.Status = Errored
+			j.mu.Unlock()
+			return err
+		}
+		j.log.nFiles++
+		*j.log.buffer = make([]byte, 0)
+	}
 	j.mu.Unlock()
+	return nil
 }
 
 // RegisterListener adds a listener channel to the poll of listener channels.
 // It also reads the files and buffer array to send all the output, from its beginning to the client.
 func (j *Job) RegisterListener(listener chan []byte) {
+	// first read the logs stored in files
 	i := 0
 	for {
 		j.mu.Lock()
 		if i == j.log.nFiles {
 			j.listeners = append(j.listeners, listener)
-			listener <- j.log.buffer
+
+			// then loads the logs from the buffer
+			readLogBuffer(listener, *j.log.buffer)
 			j.mu.Unlock()
 			break
 		}
@@ -120,7 +141,8 @@ func (s JobStatus) String() string {
 
 // appendBytes appends bytes to the output buffer
 func (c *CmdLog) appendBytes(out []byte) {
-	(*c).buffer = append(c.buffer, out...)
+	*c.buffer = append(*c.buffer, out...)
+	//	(*c).buffer = append(c.buffer, out...)
 }
 
 // readFile reads the contents of a log file from persistent storage
@@ -141,6 +163,39 @@ func readFile(ch chan []byte, filename string) error {
 			break
 		}
 		ch <- buffer[:bytesRead]
+	}
+	return nil
+}
+
+func readLogBuffer(ch chan []byte, log []byte) {
+	reader := bytes.NewReader(log)
+	buffer := make([]byte, 1024) // Buffer to read into
+	for {
+		n, err := reader.Read(buffer)
+		if n > 0 {
+			ch <- buffer[:n]
+		} else {
+			if err != nil {
+				if err == io.EOF {
+					break
+				}
+			}
+		}
+	}
+}
+
+// persistLog writes the log buffer to persistent storage in a file named jobid_index.log
+func persistLog(job *Job) error {
+	filename := fmt.Sprintf("%s_%d.log", job.Id, job.log.nFiles)
+	file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	_, err = file.Write(*job.log.buffer)
+	if err != nil {
+		return err
 	}
 	return nil
 }

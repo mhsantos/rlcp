@@ -1,6 +1,6 @@
 package executor
 
 type LogHandler interface {
-	ProcessOutput([]byte)
+	ProcessOutput([]byte) error
 	RegisterListener(chan []byte)
 }
