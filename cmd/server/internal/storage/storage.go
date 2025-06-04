@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"log/slog"
 	"os"
 	"os/exec"
 	"sync"
@@ -107,7 +106,6 @@ func (j *Job) RegisterListener(listener chan []byte) {
 	for {
 		j.mu.Lock()
 		if i == j.log.nFiles {
-			slog.Debug("reading log buffer")
 			j.listeners = append(j.listeners, listener)
 
 			// then loads the logs from the buffer
@@ -149,7 +147,6 @@ func (c *CmdLog) appendBytes(out []byte) {
 
 // readFile reads the contents of a log file from persistent storage
 func readFile(ch chan []byte, filename string) error {
-	slog.Debug("reading file")
 	file, err := os.Open(filename)
 	if err != nil {
 		return err
@@ -189,7 +186,6 @@ func readLogBuffer(ch chan []byte, log []byte) {
 
 // persistLog writes the log buffer to persistent storage in a file named jobid_index.log
 func persistLog(job *Job) error {
-	slog.Debug("writing file")
 	filename := fmt.Sprintf("%s_%d.log", job.Id, job.log.nFiles)
 	file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
