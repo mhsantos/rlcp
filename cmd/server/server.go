@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/mhsantos/rlcp/cmd/internal/pb"
 	"github.com/mhsantos/rlcp/cmd/server/internal/executor"
@@ -52,7 +53,7 @@ func (s *server) ExecCommand(ctx context.Context, req *pb.CmdRequest) (*pb.JobDe
 	// Print the incoming data
 	slog.Debug("Received", slog.String("value", command))
 
-	err := executor.RunCommand(ctx, job, command, args)
+	err := executor.RunCommand(job, command, args)
 	if err != nil {
 		slog.Error("error calling command execution")
 		return nil, err
@@ -88,16 +89,30 @@ func (s *server) GetOutput(req *pb.GetRequest, stream grpc.ServerStreamingServer
 
 	outCh := make(chan []byte)
 
-	job.RegisterListener(outCh)
+	go job.RegisterListener(outCh)
 
-	for out := range outCh {
-		slog.Debug("got", slog.String("out", string(out)))
-		err := stream.Send(&pb.JobOutput{Output: out})
-		if err != nil {
-			slog.Error("error sending response to client", slog.Any("error", err))
-			return err
+	for {
+		select {
+		case out := <-outCh:
+			err := stream.Send(&pb.JobOutput{Output: out})
+			if err != nil {
+				slog.Error("error sending response to client", slog.Any("error", err))
+				return err
+			}
+		case <-time.After(100 * time.Second):
+			fmt.Println("an error occurred")
 		}
 	}
+
+	/*
+		for out := range outCh {
+			err := stream.Send(&pb.JobOutput{Output: out})
+			if err != nil {
+				slog.Error("error sending response to client", slog.Any("error", err))
+				return err
+			}
+		}
+	*/
 	return nil
 }
 

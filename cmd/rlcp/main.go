@@ -98,7 +98,7 @@ func sendCommandToServer(option cli.Option) {
 		}
 		fmt.Printf("Job Status: %s\n", status)
 	case cli.Output:
-		err := callGetResponse(client, option.Args[0])
+		err := callGetOutput(client, option.Args[0])
 		if err != nil {
 			slog.Error("error getting output", slog.Any("error", err))
 			return
@@ -135,10 +135,8 @@ func callRunCommand(client pb.RemoteExecutorClient, args []string) (string, erro
 	return resp.JobId, nil
 }
 
-func callGetResponse(client pb.RemoteExecutorClient, jobId string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	stream, err := client.GetOutput(ctx, &pb.GetRequest{JobId: jobId})
+func callGetOutput(client pb.RemoteExecutorClient, jobId string) error {
+	stream, err := client.GetOutput(context.Background(), &pb.GetRequest{JobId: jobId})
 	if err != nil {
 		slog.Error("call to client.GetResult failed", slog.Any("error", err))
 		return err
