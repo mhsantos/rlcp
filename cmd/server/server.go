@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"time"
 
 	"github.com/mhsantos/rlcp/cmd/internal/pb"
 	"github.com/mhsantos/rlcp/cmd/server/internal/executor"
@@ -91,28 +90,13 @@ func (s *server) GetOutput(req *pb.GetRequest, stream grpc.ServerStreamingServer
 
 	go job.RegisterListener(outCh)
 
-	for {
-		select {
-		case out := <-outCh:
-			err := stream.Send(&pb.JobOutput{Output: out})
-			if err != nil {
-				slog.Error("error sending response to client", slog.Any("error", err))
-				return err
-			}
-		case <-time.After(100 * time.Second):
-			fmt.Println("an error occurred")
+	for out := range outCh {
+		err := stream.Send(&pb.JobOutput{Output: out})
+		if err != nil {
+			slog.Error("error sending response to client", slog.Any("error", err))
+			return err
 		}
 	}
-
-	/*
-		for out := range outCh {
-			err := stream.Send(&pb.JobOutput{Output: out})
-			if err != nil {
-				slog.Error("error sending response to client", slog.Any("error", err))
-				return err
-			}
-		}
-	*/
 	return nil
 }
 
