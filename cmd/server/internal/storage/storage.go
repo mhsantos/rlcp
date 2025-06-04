@@ -107,9 +107,13 @@ func (j *Job) RegisterListener(listener chan []byte) {
 		j.mu.Lock()
 		if i == j.log.nFiles {
 			j.listeners = append(j.listeners, listener)
-
 			// then loads the logs from the buffer
 			readLogBuffer(listener, *j.log.buffer)
+			if j.Status != Running {
+				// this is the scenario where we are registering a listener for a command that already
+				// finished, no matter if due to error, complete or stop
+				close(listener)
+			}
 			j.mu.Unlock()
 			break
 		}
@@ -122,6 +126,17 @@ func (j *Job) RegisterListener(listener chan []byte) {
 			i++
 		}
 	}
+}
+
+// CloseListeners iterates over the listeners pool closing each listener channel.
+// It is important in several scenarios where we have listeners getting output and a command ends,
+// to do not leave those listeners hanging.
+func (j *Job) CloseListeners() {
+	j.mu.Lock()
+	for _, listener := range j.listeners {
+		close(listener)
+	}
+	j.mu.Unlock()
 }
 
 func (s JobStatus) String() string {
