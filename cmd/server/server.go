@@ -113,6 +113,7 @@ func (s *server) StopJob(ctx context.Context, req *pb.StopRequest) (*emptypb.Emp
 		return nil, status.Errorf(codes.Unknown, "Error killing the process: %v", err)
 	}
 	job.Status = storage.Stopped
+	job.CloseListeners()
 
 	return nil, nil
 }
