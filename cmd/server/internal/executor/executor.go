@@ -4,12 +4,17 @@ import (
 	"io"
 	"log/slog"
 	"os/exec"
+	"sync"
+	"syscall"
 
 	"github.com/mhsantos/rlcp/cmd/server/internal/storage"
 )
 
 func RunCommand(job *storage.Job, command string, args []string) error {
 	cmd := exec.Command(command, args...)
+
+	// Create a new process group so we can kill the entire tree on stop
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	job.Cmd = cmd
 
@@ -30,50 +35,67 @@ func RunCommand(job *storage.Job, command string, args []string) error {
 		return err
 	}
 
-	go ListenToCommandOutput(job, stdout, stderr)
-	go waitCommand(cmd)
+	go listenToCommandOutput(job, stdout, stderr)
 
 	return nil
 }
 
-// ListenToCommandOutput reads the output from stdout and stderr and sends it to
-// LogHandler.ProcessOutput, which is responsible for storing it and forwarding it to listeners.
-func ListenToCommandOutput(job *storage.Job, stdout, stderr io.ReadCloser) {
-	defer stdout.Close()
-	defer stderr.Close()
+// KillProcessGroup sends SIGKILL to the entire process group, ensuring
+// all child processes are terminated, not just the direct child.
+func KillProcessGroup(cmd *exec.Cmd) error {
+	if cmd.Process == nil {
+		return nil
+	}
+	pgid, err := syscall.Getpgid(cmd.Process.Pid)
+	if err != nil {
+		return cmd.Process.Kill()
+	}
+	return syscall.Kill(-pgid, syscall.SIGKILL)
+}
 
-	slog.Debug("listening to command output")
+// listenToCommandOutput reads stdout and stderr concurrently and sends
+// output to job.ProcessOutput. When both streams are exhausted, it waits
+// for the process to exit and sets the terminal job status.
+func listenToCommandOutput(job *storage.Job, stdout, stderr io.ReadCloser) {
+	var wg sync.WaitGroup
+	wg.Add(2)
 
-	stream := io.MultiReader(stdout, stderr)
-
-	buff := make([]byte, 1024)
-	for {
-		n, err := stream.Read(buff)
-		if n > 0 {
-			err = job.ProcessOutput(buff[:n])
-			if err != nil {
-				slog.Error("error processing output", slog.Any("error", err))
-				if err := job.Cmd.Process.Kill(); err != nil {
-					slog.Error("error killing process", slog.Any("error", err))
+	readStream := func(r io.ReadCloser) {
+		defer wg.Done()
+		defer r.Close()
+		buf := make([]byte, 1024)
+		for {
+			n, err := r.Read(buf)
+			if n > 0 {
+				if pErr := job.ProcessOutput(buf[:n]); pErr != nil {
+					slog.Error("error processing output", slog.Any("error", pErr))
+					KillProcessGroup(job.Cmd)
 					return
 				}
 			}
-		} else {
 			if err != nil {
-				slog.Error("finished reading?", slog.Any("err", err), slog.Bool("io.EOF", err == io.EOF))
-				if err == io.EOF {
-					slog.Debug("ListenToCommandOutput EOF")
-					job.Status = storage.Completed
-					return
+				if err != io.EOF {
+					slog.Error("error reading command output", slog.Any("error", err))
 				}
-				job.Status = storage.Errored
 				return
 			}
 		}
 	}
-}
 
-// waitCommand calls exec.Cmd.Wait(), which is required to start processing the command
-func waitCommand(cmd *exec.Cmd) {
-	_ = cmd.Wait()
+	go readStream(stdout)
+	go readStream(stderr)
+
+	wg.Wait()
+
+	// Wait for the process to fully exit and capture the exit status
+	err := job.Cmd.Wait()
+	if err != nil {
+		slog.Debug("command exited with error", slog.Any("error", err))
+		// Only set Errored if the job wasn't explicitly stopped
+		if job.GetStatus() != storage.Stopped {
+			job.SetStatus(storage.Errored)
+		}
+		return
+	}
+	job.SetStatus(storage.Completed)
 }
