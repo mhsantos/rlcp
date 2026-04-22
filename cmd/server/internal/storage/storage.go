@@ -51,10 +51,12 @@ type JobStorage interface {
 // and report its output to the clients
 type Job struct {
 	Id        uuid.UUID
-	Status    JobStatus
 	Cmd       *exec.Cmd
 	mu        sync.Mutex
+	status    JobStatus
 	log       *CmdLog
+	done      chan struct{} // closed when the job reaches a terminal state
+	closeOnce sync.Once
 	listeners []chan []byte
 }
 
@@ -71,23 +73,56 @@ func NewJob() *Job {
 		log: &CmdLog{
 			buffer: &buffer,
 		},
+		done:      make(chan struct{}),
 		listeners: make([]chan []byte, 0),
 	}
+}
+
+// SetStatus sets the job status in a thread-safe manner.
+// If the status is terminal (Completed, Errored, Stopped), it also closes
+// all listener channels and signals the done channel.
+func (j *Job) SetStatus(s JobStatus) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.status = s
+	if s == Completed || s == Errored || s == Stopped {
+		j.closeOnce.Do(func() {
+			for _, listener := range j.listeners {
+				close(listener)
+			}
+			j.listeners = nil
+			close(j.done)
+		})
+	}
+}
+
+// GetStatus returns the job status in a thread-safe manner.
+func (j *Job) GetStatus() JobStatus {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	return j.status
+}
+
+// Done returns a channel that is closed when the job reaches a terminal state.
+func (j *Job) Done() <-chan struct{} {
+	return j.done
 }
 
 // ProcessOutput receives an array of bytes from the command's output and sends it to the receiver channels.
 // After that it stores it in a temporary buffer. Once that buffer is full, it's stored on disk and flushed.
 func (j *Job) ProcessOutput(out []byte) error {
 	j.mu.Lock()
-	for _, listener := range j.listeners {
-		listener <- out
-	}
+
+	// Copy listeners under lock, then send outside lock to avoid deadlock
+	listeners := make([]chan []byte, len(j.listeners))
+	copy(listeners, j.listeners)
+
 	j.log.appendBytes(out)
 
 	if len(*j.log.buffer) >= logFileSize {
 		err := persistLog(j)
 		if err != nil {
-			j.Status = Errored
+			j.status = Errored
 			j.mu.Unlock()
 			return err
 		}
@@ -95,11 +130,24 @@ func (j *Job) ProcessOutput(out []byte) error {
 		*j.log.buffer = make([]byte, 0)
 	}
 	j.mu.Unlock()
+
+	// Send to listeners outside the lock to prevent deadlock.
+	// Each listener gets its own copy to prevent slice aliasing.
+	for _, listener := range listeners {
+		data := make([]byte, len(out))
+		copy(data, out)
+		select {
+		case listener <- data:
+		case <-j.done:
+			return nil
+		}
+	}
+
 	return nil
 }
 
-// RegisterListener adds a listener channel to the poll of listener channels.
-// It also reads the files and buffer array to send all the output, from its beginning to the client.
+// RegisterListener adds a listener channel to the pool of listener channels.
+// It also reads the files and buffer array to send all the output, from its beginning, to the client.
 func (j *Job) RegisterListener(listener chan []byte) {
 	// first read the logs stored in files
 	i := 0
@@ -109,7 +157,7 @@ func (j *Job) RegisterListener(listener chan []byte) {
 			j.listeners = append(j.listeners, listener)
 			// then loads the logs from the buffer
 			readLogBuffer(listener, *j.log.buffer)
-			if j.Status != Running {
+			if j.status != Running {
 				// this is the scenario where we are registering a listener for a command that already
 				// finished, no matter if due to error, complete or stop
 				close(listener)
@@ -126,6 +174,9 @@ func (j *Job) RegisterListener(listener chan []byte) {
 			i++
 		}
 	}
+
+	// Block until job is done
+	<-j.done
 }
 
 // CloseListeners iterates over the listeners pool closing each listener channel.
@@ -157,7 +208,6 @@ func (s JobStatus) String() string {
 // appendBytes appends bytes to the output buffer
 func (c *CmdLog) appendBytes(out []byte) {
 	*c.buffer = append(*c.buffer, out...)
-	//	(*c).buffer = append(c.buffer, out...)
 }
 
 // readFile reads the contents of a log file from persistent storage
@@ -177,24 +227,25 @@ func readFile(ch chan []byte, filename string) error {
 			}
 			break
 		}
-		ch <- buffer[:bytesRead]
+		data := make([]byte, bytesRead)
+		copy(data, buffer[:bytesRead])
+		ch <- data
 	}
 	return nil
 }
 
 func readLogBuffer(ch chan []byte, log []byte) {
 	reader := bytes.NewReader(log)
-	buffer := make([]byte, 1024) // Buffer to read into
+	buffer := make([]byte, 1024)
 	for {
 		n, err := reader.Read(buffer)
 		if n > 0 {
-			ch <- buffer[:n]
-		} else {
-			if err != nil {
-				if err == io.EOF {
-					break
-				}
-			}
+			data := make([]byte, n)
+			copy(data, buffer[:n])
+			ch <- data
+		}
+		if err != nil {
+			break
 		}
 	}
 }
@@ -202,15 +253,12 @@ func readLogBuffer(ch chan []byte, log []byte) {
 // persistLog writes the log buffer to persistent storage in a file named jobid_index.log
 func persistLog(job *Job) error {
 	filename := fmt.Sprintf("%s_%d.log", job.Id, job.log.nFiles)
-	file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {
 		return err
 	}
 	defer file.Close()
 
 	_, err = file.Write(*job.log.buffer)
-	if err != nil {
-		return err
-	}
-	return nil
+	return err
 }

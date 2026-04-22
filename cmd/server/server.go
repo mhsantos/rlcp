@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"log/slog"
 
 	"github.com/mhsantos/rlcp/cmd/internal/pb"
@@ -25,22 +23,23 @@ func NewServer(db storage.JobStorage) *server {
 		db: db,
 	}
 }
+
 func (s *server) ExecCommand(ctx context.Context, req *pb.CmdRequest) (*pb.JobDetails, error) {
 	email := getRequesterEmail(ctx)
 	if len(email) == 0 {
 		slog.Error("invalid client email")
-		return nil, errors.New("email not informed on CommonName")
+		return nil, status.Errorf(codes.Unauthenticated, "email not informed on CommonName")
 	}
 
 	userId, ok := s.db.GetUserId(email)
 	if !ok {
-		slog.Error("user id not found")
-		return nil, errors.New("couldn't find a user for the informed email")
+		slog.Error("user id not found", slog.String("email", email))
+		return nil, status.Errorf(codes.Unauthenticated, "couldn't find a user for the informed email")
 	}
 
 	if !s.db.Authorized(userId, storage.Run) {
-		slog.Error("not authorized")
-		return nil, errors.New("user not authorized to Run commands")
+		slog.Error("not authorized", slog.String("userId", userId))
+		return nil, status.Errorf(codes.PermissionDenied, "user not authorized to Run commands")
 	}
 
 	job := storage.NewJob()
@@ -49,13 +48,12 @@ func (s *server) ExecCommand(ctx context.Context, req *pb.CmdRequest) (*pb.JobDe
 	command := req.Command
 	args := req.Arguments
 
-	// Print the incoming data
 	slog.Debug("Received", slog.String("value", command))
 
 	err := executor.RunCommand(job, command, args)
 	if err != nil {
-		slog.Error("error calling command execution")
-		return nil, err
+		slog.Error("error calling command execution", slog.Any("error", err))
+		return nil, status.Errorf(codes.Internal, "failed to start command: %v", err)
 	}
 
 	return &pb.JobDetails{
@@ -71,11 +69,9 @@ func (s *server) GetStatus(ctx context.Context, req *pb.GetRequest) (*pb.JobDeta
 		return nil, status.Errorf(codes.NotFound, "Could not find a job for the id provided")
 	}
 
-	fmt.Printf("jobid: %s, status:%s, pbStatus: %s\n", jobId, job.Status, pb.JobDetails_Status(job.Status))
-
 	return &pb.JobDetails{
 		JobId:  jobId,
-		Status: pb.JobDetails_Status(job.Status),
+		Status: pb.JobDetails_Status(job.GetStatus()),
 	}, nil
 }
 
@@ -108,12 +104,11 @@ func (s *server) StopJob(ctx context.Context, req *pb.StopRequest) (*emptypb.Emp
 		return nil, status.Errorf(codes.NotFound, "Could not find a job for the id provided")
 	}
 
-	if err := job.Cmd.Process.Kill(); err != nil {
-		job.Status = storage.Errored
+	if err := executor.KillProcessGroup(job.Cmd); err != nil {
+		job.SetStatus(storage.Errored)
 		return nil, status.Errorf(codes.Unknown, "Error killing the process: %v", err)
 	}
-	job.Status = storage.Stopped
-	job.CloseListeners()
+	job.SetStatus(storage.Stopped)
 
-	return nil, nil
+	return &emptypb.Empty{}, nil
 }
